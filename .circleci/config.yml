@@ -1,0 +1,96 @@
+version: 2.1
+orbs:
+  gcp-gcr: circleci/gcp-gcr@0.16.2
+  gcp-cli: circleci/gcp-cli@3.1.1
+
+jobs:
+
+  test:
+    docker:
+      - image: cimg/go:1.22
+      - image: clickhouse/clickhouse-server:23.12.4.15
+        environment:
+          - CLICKHOUSE_DB: db
+          - CLICKHOUSE_USER: user
+          - CLICKHOUSE_PASSWORD: pass
+
+    steps:
+      - checkout
+      - restore_cache:
+          key: dependency-v1-cache-{{ checksum "go.sum" }}
+      - run:
+          name: Vendor
+          command: go mod vendor
+      - run:
+          command: make lint
+      - save_cache:
+          key: dependency-v1-cache-{{ checksum "go.sum" }}
+          paths:
+            - ./vendor
+      - run:
+          name: Wait for ClickHouse
+          command: |
+            for i in `seq 1 10`;
+            do
+            nc -z localhost 9000 && echo Success && exit 0
+            echo -n .
+            sleep 1
+            done
+            echo Failed waiting for ClickHouse && exit 1
+      - run:
+          name: Tests
+          command: make test
+          environment:
+            - CLICKHOUSE_HOST: 127.0.0.1:9000
+            - CLICKHOUSE_DB: db
+            - CLICKHOUSE_USER: user
+            - CLICKHOUSE_PASSWORD: pass
+      - store_test_results:
+          path: test_reports
+
+  build_and_push_docker:
+    docker:
+      - image: cimg/go:1.22
+
+    steps:
+      - checkout
+      - run:
+          name: Setup Environment Variables
+          command: |
+            echo 'export IMAGE_NAME=us.gcr.io/${GOOGLE_PROJECT_ID}/${CIRCLE_PROJECT_REPONAME}' >> $BASH_ENV
+            echo 'export IMAGE_TAG=${CIRCLE_SHA1}' >> $BASH_ENV
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Build
+          environment:
+            DOCKER_CLI_EXPERIMENTAL: enabled
+          command: make build-docker
+      - gcp-gcr/gcr-auth
+      - gcp-gcr/push-image:
+          image: $CIRCLE_PROJECT_REPONAME
+          tag: $CIRCLE_SHA1
+          registry-url: us.gcr.io
+
+workflows:
+
+  build:
+    jobs:
+      - test
+      - build_and_push_docker:
+          requires:
+            - test
+          context:
+            - GCR
+      - gcp-gcr/add-image-tag:
+          requires:
+            - build_and_push_docker
+          context: GCR
+          image: $CIRCLE_PROJECT_REPONAME
+          source-tag: $CIRCLE_SHA1
+          target-tag: latest
+          registry-url: us.gcr.io
+          filters:
+            branches:
+              only:
+                - main
